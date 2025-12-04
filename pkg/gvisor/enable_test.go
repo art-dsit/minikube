@@ -25,3 +25,5 @@ func TestConfigFragment(t *testing.T) {
 			t.Errorf("configFragment() missing expected substring:\ngot:\n%s\n\nwant to contain:\n%s", got, want)
 		}
 	}
+
+}
