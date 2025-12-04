@@ -36,12 +36,7 @@ const (
 	nodeDir                    = "/node"
 	containerdConfigPath       = "/etc/containerd/config.toml"
 	containerdConfigBackupPath = "/tmp/containerd-config.toml.bak"
-
-	configFragment = `
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
-  runtime_type = "io.containerd.runsc.v1"
-  pod_annotations = [ "dev.gvisor.*" ]
-`
+	runscConfigPath            = "/etc/containerd/runsc.toml"
 )
 
 var (
@@ -60,10 +55,51 @@ func releaseURL() string {
 	return fmt.Sprintf("https://storage.googleapis.com/gvisor/releases/release/latest/%s/", arch)
 }
 
+// detectCgroupVersion detects the cgroup version on the node.
+// Returns "v2" for cgroupv2 (systemd), "v1" for cgroupv1 (cgroupfs), or "" if unable to detect.
+func detectCgroupVersion() string {
+	// Check if /sys/fs/cgroup/cgroup.controllers exists (cgroupv2 indicator)
+	cgroupControllersPath := filepath.Join(nodeDir, "sys/fs/cgroup/cgroup.controllers")
+	if _, err := os.Stat(cgroupControllersPath); err == nil {
+		log.Print("Detected cgroupv2 on node")
+		return "v2"
+	}
+
+	// Check for cgroupv1 by looking for /sys/fs/cgroup/memory
+	cgroupMemoryPath := filepath.Join(nodeDir, "sys/fs/cgroup/memory")
+	if _, err := os.Stat(cgroupMemoryPath); err == nil {
+		log.Print("Detected cgroupv1 on node")
+		return "v1"
+	}
+
+	log.Print("Unable to detect cgroup version on node")
+	return ""
+}
+
+// configFragment returns the containerd configuration fragment for runsc runtime.
+// If cgroupv2 is detected, it includes additional options to enable systemd cgroup
+// support for cgroupv2 compatibility.
+func configFragment() string {
+	baseConfig := `
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+  pod_annotations = [ "dev.gvisor.*" ]`
+
+	// If cgroupv2 is detected, add options section to reference the runsc config file
+	if detectCgroupVersion() == "v2" {
+		baseConfig += `
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc.options]
+    TypeUrl = "io.containerd.runsc.v1.options"
+    ConfigPath = "` + runscConfigPath + `"`
+	}
+
+	return baseConfig + "\n"
+}
+
 // Enable follows these steps for enabling gvisor in minikube:
 //  1. creates necessary directories for storing binaries and runsc logs
 //  2. downloads runsc and gvisor-containerd-shim
-//  3. configures containerd
+//  3. configures containerd (with systemd cgroup support if cgroupv2 is detected)
 //  4. restarts containerd
 func Enable() error {
 	if err := makeGvisorDirs(); err != nil {
@@ -168,7 +204,8 @@ func downloadFileToDest(url, dest string) error {
 
 // configure changes containerd `config.toml` file to include runsc runtime. A
 // copy of the original file is stored under `/tmp` to be restored when this
-// plug in is disabled.
+// plug in is disabled. If cgroupv2 is detected, it also creates a runsc.toml
+// configuration file with systemd cgroup support enabled.
 func configure() error {
 	log.Printf("Storing default config.toml at %s", containerdConfigBackupPath)
 	configPath := filepath.Join(nodeDir, containerdConfigPath)
@@ -176,12 +213,26 @@ func configure() error {
 		return errors.Wrap(err, "copying default config.toml")
 	}
 
-	// Append runsc configuration to contained config.
+	// If cgroupv2 is detected, create runsc.toml with systemd cgroup support
+	if detectCgroupVersion() == "v2" {
+		log.Print("Creating runsc.toml with systemd cgroup support")
+		runscConfigContent := `[runsc_config]
+  systemd-cgroup = "true"
+`
+		runscConfigFullPath := filepath.Join(nodeDir, runscConfigPath)
+		if err := os.WriteFile(runscConfigFullPath, []byte(runscConfigContent), 0644); err != nil {
+			return errors.Wrap(err, "creating runsc.toml")
+		}
+		log.Printf("Created %s", runscConfigPath)
+	}
+
+	// Append runsc configuration to containerd config
 	config, err := os.OpenFile(configPath, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		return err
 	}
-	if _, err := config.WriteString(configFragment); err != nil {
+	defer config.Close()
+	if _, err := config.WriteString(configFragment()); err != nil {
 		return errors.Wrap(err, "changing config.toml")
 	}
 	return nil

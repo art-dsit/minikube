@@ -35,6 +35,16 @@ func Disable() error {
 	if err := mcnutils.CopyFile(filepath.Join(nodeDir, containerdConfigBackupPath), filepath.Join(nodeDir, containerdConfigPath)); err != nil {
 		return errors.Wrap(err, "reverting back to default config.toml")
 	}
+
+	// Remove runsc.toml if it exists (created for cgroupv2 support)
+	runscConfigFullPath := filepath.Join(nodeDir, runscConfigPath)
+	if _, err := os.Stat(runscConfigFullPath); err == nil {
+		log.Printf("Removing %s", runscConfigPath)
+		if err := os.Remove(runscConfigFullPath); err != nil {
+			log.Printf("Warning: failed to remove %s: %v", runscConfigPath, err)
+		}
+	}
+
 	// restart containerd
 	if err := restartContainerd(); err != nil {
 		return errors.Wrap(err, "restarting containerd")
